@@ -33,7 +33,7 @@ def main():
     p = 0.01
     mu = 0.5
     K = 50_000           # large to estimate conditional probability tightly
-    alpha_list = [0.5, 0.2, 0.1, 0.05, 0.02, 0.01]
+    alpha_list = np.arange(0.5, 0.001, -0.001)  # from 5% to 0.5% by 0.5%
     n_trials = 40
     n_for_J = 600_000
 
