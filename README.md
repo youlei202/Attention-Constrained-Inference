@@ -1,7 +1,7 @@
-# ACLI (Attention-Constrained Leaderless Inference) — Reproducible Experiments
+# ACI (Attention-Constrained Inference) — Reproducible Experiments
 
 This repo is a lightweight, reproducible experiment suite for the ACLI paper:
-**"Attention-Constrained Leaderless Inference: Fundamental Limits Under Log-Loss"**.
+**"Attention-Constrained Inference: Fundamental Limits Under Log-Loss"**.
 
 The design goal is **clean modular code** + **strict reproducibility** + **simple experiment entrypoints**
 (each experiment is a standalone `python experiment/00_xxx.py` without CLI args).
