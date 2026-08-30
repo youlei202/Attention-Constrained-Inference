@@ -38,6 +38,7 @@ Output:
 
 from __future__ import annotations
 
+import argparse
 import math
 import sys
 from pathlib import Path
@@ -50,6 +51,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from acli.utils import RunMeta, set_seed
+from acli.revision.reproducibility import canonical_configuration, make_rng, stable_task_seed
+from acli.revision.suite import git_commit
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--smoke", action="store_true", help="use a smaller Monte Carlo sample")
+    return parser.parse_args()
 
 
 def _empirical_tail_mean(G: np.ndarray, alpha: float) -> tuple[float, float, int]:
@@ -122,6 +131,7 @@ def _gain_from_mG(
 
 
 def main() -> None:
+    args = parse_args()
     seed = 1357
     set_seed(seed)
 
@@ -134,7 +144,7 @@ def main() -> None:
 
     # ------------------ Sampling config ------------------
     # Choose enough samples so that even α=1e-4 has a few hundred points in the tail.
-    n_samples = 2_000_000
+    n_samples = 100_000 if args.smoke else 2_000_000
     alpha_list = [
         5e-1,
         2e-1,
@@ -160,12 +170,26 @@ def main() -> None:
     out_csv = ROOT / "result" / "table" / "04_tail_leverage_gaussian_vs_pareto.csv"
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    rng = np.random.default_rng(seed)
+    sample_configuration = {
+        "n_samples": n_samples,
+        "alpha_list": alpha_list,
+        "p": p,
+        "J_bits": J_bits,
+        "B": B,
+        "nu": nu,
+    }
+    gaussian_seed = stable_task_seed(
+        seed, "legacy_04", "gaussian_samples", sample_configuration
+    )
+    pareto_seed = stable_task_seed(
+        seed, "legacy_04", "pareto_samples", sample_configuration
+    )
 
     rows: list[dict] = []
 
     # ---------- Gaussian ----------
-    G_gauss = rng.standard_normal(n_samples).astype(np.float64)
+    gaussian_rng = make_rng(gaussian_seed)
+    G_gauss = gaussian_rng.standard_normal(n_samples).astype(np.float64)
 
     for alpha in alpha_list:
         m_hat, q_hat, k = _empirical_tail_mean(G_gauss, alpha)
@@ -191,6 +215,10 @@ def main() -> None:
                 "mG_asympt": m_asym,
                 "ratio_emp_to_exact": m_hat / m_exact,
                 "ratio_emp_to_asympt": m_hat / m_asym,
+                "nu": 0.0,
+                "pareto_mu": 0.0,
+                "pareto_sigma": 0.0,
+                "pareto_C_nu": 0.0,
                 # gain mapping parameters
                 "p": p,
                 "J": J_bits,
@@ -220,14 +248,17 @@ def main() -> None:
         )
 
     # ---------- Pareto ----------
-    X = _sample_pareto_tail(n_samples, nu=nu, rng=rng)
+    pareto_rng = make_rng(pareto_seed)
+    X = _sample_pareto_tail(n_samples, nu=nu, rng=pareto_rng)
     G_pareto = (X - mu) / sigma
 
     for alpha in alpha_list:
         m_hat, q_hat, k = _empirical_tail_mean(G_pareto, alpha)
+        m_exact = float((mu * alpha ** (-1.0 / nu) - mu) / sigma)
         m_asym = float(C_nu * (alpha ** (-1.0 / nu)))
 
         gain_emp = _gain_from_mG(m_hat, p=p, J_bits=J_bits, B=B, I_ver=I_ver)
+        gain_exact = _gain_from_mG(m_exact, p=p, J_bits=J_bits, B=B, I_ver=I_ver)
         gain_asym = _gain_from_mG(m_asym, p=p, J_bits=J_bits, B=B, I_ver=I_ver)
 
         rows.append(
@@ -239,9 +270,9 @@ def main() -> None:
                 "k_tail": k,
                 "q_emp": q_hat,
                 "mG_emp": m_hat,
-                "mG_exact": np.nan,  # no simple closed form for standardized G
+                "mG_exact": m_exact,
                 "mG_asympt": m_asym,
-                "ratio_emp_to_exact": np.nan,
+                "ratio_emp_to_exact": m_hat / m_exact,
                 "ratio_emp_to_asympt": m_hat / m_asym,
                 # pareto params
                 "nu": nu,
@@ -255,18 +286,18 @@ def main() -> None:
                 "I_ver": I_ver,
                 # gain columns (emp/asym)
                 "gain_over_Iver_emp": gain_emp["gain_over_Iver"],
-                "gain_over_Iver_exact": np.nan,
+                "gain_over_Iver_exact": gain_exact["gain_over_Iver"],
                 "gain_over_Iver_asympt": gain_asym["gain_over_Iver"],
                 "gain_over_Iver_raw_emp": gain_emp["gain_over_Iver_raw"],
-                "gain_over_Iver_raw_exact": np.nan,
+                "gain_over_Iver_raw_exact": gain_exact["gain_over_Iver_raw"],
                 "gain_over_Iver_raw_asympt": gain_asym["gain_over_Iver_raw"],
                 "bonus_over_Iver_emp": gain_emp["bonus_over_Iver"],
-                "bonus_over_Iver_exact": np.nan,
+                "bonus_over_Iver_exact": gain_exact["bonus_over_Iver"],
                 "bonus_over_Iver_asympt": gain_asym["bonus_over_Iver"],
                 "baseline_over_Iver": gain_emp["baseline_over_Iver"],
                 "oracle_over_Iver": gain_emp["oracle_over_Iver"],
                 "gain_bits_emp": gain_emp["gain_bits"],
-                "gain_bits_exact": np.nan,
+                "gain_bits_exact": gain_exact["gain_bits"],
                 "gain_bits_asympt": gain_asym["gain_bits"],
                 "gain_const_C": gain_emp["gain_const_C"],
             }
@@ -279,7 +310,26 @@ def main() -> None:
     meta = RunMeta.now(seed=seed, device="cpu").__dict__
     df = pd.DataFrame(rows)
     for k, v in meta.items():
-        df[k] = v
+        if k not in df.columns:
+            df[k] = v
+    df["master_seed"] = seed
+    df["seed"] = [
+        gaussian_seed if distribution == "gaussian" else pareto_seed
+        for distribution in df["dist"]
+    ]
+    df["configuration"] = [
+        canonical_configuration(
+            {
+                **sample_configuration,
+                "distribution": row.dist,
+                "alpha": float(row.alpha),
+                "sample_seed": int(row.seed),
+            }
+        )
+        for row in df.itertuples()
+    ]
+    df["git_commit"] = git_commit(ROOT)
+    df["method"] = "Monte_Carlo_tail_mean_with_exact_and_asymptotic_formulas"
 
     df.to_csv(out_csv, index=False)
     print(f"Saved: {out_csv}")

@@ -71,7 +71,7 @@ def benchmark_simulate_topB_sum_eta(
     # ---------- GPU batched path ----------
     if device == "cuda" and _TORCH_OK and torch.cuda.is_available():
         gen = torch.Generator(device="cuda")
-        gen.manual_seed(int(seed))
+        gen.manual_seed(int(seed) % (2**63 - 1))
 
         p = float(model.p)
         mu = float(model.mu)
@@ -91,7 +91,7 @@ def benchmark_simulate_topB_sum_eta(
         return mean, se
 
     # ---------- CPU fallback ----------
-    rng = np.random.default_rng(seed)
+    rng = np.random.Generator(np.random.PCG64DXSM(seed))
     policy = TopBPolicy()
 
     vals = np.empty(n_trials, dtype=np.float64)
@@ -128,7 +128,7 @@ def simulate_hits_topB(
     # ---------- GPU batched path ----------
     if device == "cuda" and _TORCH_OK and torch.cuda.is_available():
         gen = torch.Generator(device="cuda")
-        gen.manual_seed(int(seed))
+        gen.manual_seed(int(seed) % (2**63 - 1))
 
         p = float(model.p)
         mu = float(model.mu)
@@ -146,7 +146,7 @@ def simulate_hits_topB(
         return mean, se
 
     # ---------- CPU fallback ----------
-    rng = np.random.default_rng(seed)
+    rng = np.random.Generator(np.random.PCG64DXSM(seed))
     policy = TopBPolicy()
 
     vals = np.empty(n_trials, dtype=np.float64)

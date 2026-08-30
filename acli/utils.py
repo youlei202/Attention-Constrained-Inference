@@ -53,9 +53,10 @@ def get_device(prefer_cuda: bool = True) -> str:
 
 
 def h2(x: float) -> float:
-    """Binary entropy in bits."""
-    x = min(max(x, 1e-12), 1 - 1e-12)
-    return float(-(x * np.log2(x) + (1 - x) * np.log2(1 - x)))
+    """Binary entropy in bits (compatibility wrapper around the canonical implementation)."""
+    from .revision.information import h2 as canonical_h2
+
+    return float(canonical_h2(x))
 
 
 @dataclass(frozen=True)

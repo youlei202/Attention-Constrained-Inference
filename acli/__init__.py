@@ -1,7 +1,7 @@
-"""ACLI: Attention-Constrained Leaderless Inference.
+"""ACI: Attention-Constrained Inference.
 
 Core code for experiments accompanying the paper:
-"Attention-Constrained Leaderless Inference: Fundamental Limits Under Log-Loss"
+"Epistemic Throughput: Fundamental Limits of Attention-Constrained Inference"
 
 This package is intentionally small and modular:
 - screening models (produce cheap scores)
@@ -35,4 +35,4 @@ __all__ = [
     "simulate_hits_topB",
     "estimate_J_monte_carlo",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

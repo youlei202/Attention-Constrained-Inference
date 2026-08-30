@@ -1,0 +1,15 @@
+profile: smoke
+master_seed: 260183
+workers: 4
+large_k_workers: 2
+quadrature_order: 24
+random_channels: 250
+bruteforce_instances: 40
+finite_k_mc_reps: 120
+reconstructed_fig6_reps: 120
+max_n: 256
+finite_k_values: [200, 500, 1000, 3000, 10000]
+finite_k_full_sweep: false
+frontier_full_grid: false
+weak_validity_alpha_points: 8
+weak_validity_j_points: 6
