@@ -2,7 +2,7 @@
 
 Reproducible numerical experiments for **“Epistemic Throughput: Fundamental Limits of Attention-Constrained Inference.”**
 
-The repository keeps a small core library, standalone experiment entrypoints, and plotting notebooks that read cached result tables.  The original experiments `00`–`05` remain available; the major-revision pipeline adds exact calibration, sharp binary-information frontiers, shared-target accumulation, finite-pool convergence, stress audits, and complete paper-figure reproduction.
+The repository contains a compact numerical library, standalone experiment entrypoints, and plotting notebooks that read cached result tables. Experiments `00`–`05` cover the core benchmarks, while `06`–`09` provide exact calibration, sharp binary-information frontiers, shared-target accumulation, finite-pool convergence, stress audits, and complete paper-figure reproduction.
 
 ## Quickstart
 
@@ -14,7 +14,7 @@ pip install -r requirements-dev.txt
 pip install -e .
 ```
 
-Run the original core experiments (each writes a CSV under `result/table/`):
+Run the core experiments (each writes a CSV under `result/table/`):
 
 ```bash
 python experiment/00_benchmark_theory_vs_sim.py
@@ -24,7 +24,7 @@ python experiment/02_lemma4_enrichment_bound.py
 
 The historical filenames are retained for compatibility.  New documentation and outputs use semantic names rather than theorem numbers where numbering may change.
 
-## Major-revision numerical modules
+## Numerical modules
 
 The `acli.revision` package provides:
 
@@ -36,7 +36,7 @@ The `acli.revision` package provides:
 - deterministic finite-`K` top-`B` precision and large-`K` top-tail limits;
 - checkpointed experiment orchestration, plotting helpers, and output validation.
 
-Standalone major-revision experiments are `experiment/06_*.py` through `experiment/09_*.py`.  The orchestrator is `experiment/10_run_major_revision_suite.py`.
+Standalone analysis experiments are numbered `06` through `09`. The suite runner discovers and executes them with deterministic task seeds and restart-safe checkpoints.
 
 ## Reproduce all paper figures
 
@@ -47,20 +47,14 @@ bash scripts/run_revision_suite.sh smoke
 bash scripts/execute_revision_notebook.sh
 ```
 
-The formal CPU reproduction uses the paper profile and restart-safe checkpoints:
+Run the complete paper configuration with restart-safe checkpoints:
 
 ```bash
-tmux new-session -d -s aci_major_revision_integration \
-  "cd /work/Users/leiyo/GitHub/Attention-Constrained-Inference && bash scripts/tmux_revision_entrypoint.sh 2>&1 | tee -a logs/aci_major_revision_integration.log"
+bash scripts/run_revision_suite.sh paper
+bash scripts/execute_revision_notebook.sh
 ```
 
-Monitor it with:
-
-```bash
-bash scripts/status_revision.sh
-```
-
-The paper notebook is `notebook/06_major_revision_paper_figures.ipynb`.  It only reads `result/table/*.csv` and performs lightweight deterministic formulas; the 50,000-channel stress test and large simulations run in the experiment suite, not in the notebook.  Every paper figure is saved as vector PDF and at least 300-dpi PNG under `result/figure/paper/`.
+The paper-figure notebook under `notebook/` only reads `result/table/*.csv` and performs lightweight deterministic formulas; the 50,000-channel stress test and large simulations run in the experiment suite, not in the notebook. Every paper figure is saved as vector PDF and at least 300-dpi PNG under `result/figure/paper/`.
 
 ## Result layout
 
@@ -71,7 +65,7 @@ result/
 └── artifact/    # executed notebook, HTML, validation manifests, and test report
 ```
 
-Generated results, logs, checkpoints, environments, and delivery archives are ignored by Git.  `scripts/package_revision_bundle.py` packages the validated outputs plus a source snapshot into `ACI_MAJOR_REVISION_REPRODUCIBILITY_BUNDLE.zip` and writes its SHA-256 checksum beside it.
+Generated results, logs, checkpoints, environments, and delivery archives are ignored by Git. After a validated run, `scripts/package_revision_bundle.py` packages the outputs together with a source snapshot and writes a SHA-256 checksum beside the archive.
 
 ## Numerical conventions
 
