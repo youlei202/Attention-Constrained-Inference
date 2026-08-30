@@ -22,6 +22,15 @@ sys.path.insert(0, str(ROOT))
 from acli.utils import set_seed, RunMeta, get_device
 from acli.screening import GaussianMixtureScreening
 from acli.benchmark import estimate_J_monte_carlo, simulate_hits_topB
+from acli.revision.frontier import (
+    binary_selection_information,
+    feasible_q_bounds,
+    q_one_branch_raw,
+    q_pinsker_clipped,
+    q_star as exact_q_star,
+)
+from acli.revision.reproducibility import canonical_configuration, stable_task_seed
+from acli.revision.suite import git_commit
 
 
 def main():
@@ -42,12 +51,43 @@ def main():
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
     model = GaussianMixtureScreening(p=p, mu=mu, sigma=1.0)
-    J = estimate_J_monte_carlo(model, n=n_for_J, seed=seed)
+    j_configuration = {"p": p, "mu": mu, "sigma": 1.0, "n_for_J": n_for_J}
+    j_seed = stable_task_seed(seed, "legacy_01", "estimate_J", j_configuration)
+    J = estimate_J_monte_carlo(model, n=n_for_J, seed=j_seed)
 
     rows = []
     for K in K_list:
-        sim, se = simulate_hits_topB(model, K=K, B=B, n_trials=n_trials, seed=seed + K, device=device)
+        alpha = B / K
+        task_configuration = {
+            "p": p,
+            "mu": mu,
+            "K": K,
+            "B": B,
+            "n_trials": n_trials,
+            "n_for_J": n_for_J,
+            "J_seed": j_seed,
+            "J_bits": J,
+        }
+        task_seed = stable_task_seed(seed, "legacy_01", "simulate_hits", task_configuration)
+        sim, se = simulate_hits_topB(
+            model,
+            K=K,
+            B=B,
+            n_trials=n_trials,
+            seed=task_seed,
+            device=device,
+        )
         ub = B * p + math.sqrt((math.log(2) / 2.0) * J * B * K)
+        sharp_precision = exact_q_star(p, alpha, J)
+        two_branch_precision = q_pinsker_clipped(p, alpha, J)
+        one_branch_raw_precision = q_one_branch_raw(p, alpha, J)
+        oracle_precision = feasible_q_bounds(p, alpha)[1]
+        ceiling_hit = sharp_precision == oracle_precision and J >= binary_selection_information(
+            oracle_precision, p, alpha
+        ) - 2e-12
+        residual = 0.0 if ceiling_hit else abs(
+            binary_selection_information(sharp_precision, p, alpha) - J
+        )
         rows.append(
             dict(
                 K=K,
@@ -58,10 +98,28 @@ def main():
                 J=J,
                 n_trials=n_trials,
                 n_for_J=n_for_J,
+                J_seed=j_seed,
                 sim_E_hits=sim,
                 sim_SE=se,
                 theorem6_upper_bound_hits=ub,
                 baseline_Bp=B * p,
+                alpha=alpha,
+                empirical=sim / B,
+                q_star=sharp_precision,
+                two_branch_pinsker=two_branch_precision,
+                one_branch_pinsker=one_branch_raw_precision,
+                oracle=oracle_precision,
+                empirical_hits=sim,
+                q_star_hits=B * sharp_precision,
+                two_branch_pinsker_hits=B * two_branch_precision,
+                one_branch_pinsker_hits=B * one_branch_raw_precision,
+                oracle_hits=B * oracle_precision,
+                q_star_residual=residual,
+                q_star_ceiling_hit=ceiling_hit,
+                seed=task_seed,
+                configuration=canonical_configuration(task_configuration),
+                git_commit=git_commit(ROOT),
+                method="Monte_Carlo_empirical_with_exact_two_branch_frontier",
             )
         )
         print(f"[{device}] K={K:6d} | sim={sim:.6f} ± {2*se:.6f} | UB={ub:.6f} | Bp={B*p:.6f}")
@@ -69,7 +127,9 @@ def main():
     meta = RunMeta.now(seed=seed, device=device).__dict__
     df = pd.DataFrame(rows)
     for k, v in meta.items():
-        df[k] = v
+        if k not in df.columns:
+            df[k] = v
+    df["master_seed"] = seed
 
     df.to_csv(out_csv, index=False)
     print(f"Saved: {out_csv}")

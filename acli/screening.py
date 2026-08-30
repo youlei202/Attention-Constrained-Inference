@@ -63,16 +63,16 @@ class GaussianMixtureScreening(ScreeningModel):
             Z: real array/tensor of shape (K,)
         """
         if seed is not None:
-            rng = np.random.default_rng(seed)
+            rng = np.random.Generator(np.random.PCG64DXSM(seed))
         else:
-            rng = np.random.default_rng()
+            rng = np.random.Generator(np.random.PCG64DXSM())
 
         if device == "cuda" and _TORCH_OK and torch.cuda.is_available():
             # Use torch on GPU for speed (best-effort reproducible).
             # We still use numpy RNG to generate seeds for torch to keep behavior stable.
             gen = torch.Generator(device="cuda")
             if seed is not None:
-                gen.manual_seed(int(seed))
+                gen.manual_seed(int(seed) % (2**63 - 1))
 
             T = torch.bernoulli(torch.full((K,), self.p, device="cuda"), generator=gen).to(torch.int64)
             Z = torch.randn((K,), device="cuda", generator=gen) * self.sigma + self.mu * T.to(torch.float32)
@@ -108,7 +108,7 @@ class GaussianMixtureScreening(ScreeningModel):
 
     def estimate_J(self, n: int = 300_000, seed: int = 0) -> float:
         """Estimate J=I(T;Z) in bits via MC: E[log2 P(T|Z)/P(T)]."""
-        rng = np.random.default_rng(seed)
+        rng = np.random.Generator(np.random.PCG64DXSM(seed))
         T = rng.binomial(1, self.p, size=n).astype(np.int64)
         Z = rng.normal(loc=self.mu * T, scale=self.sigma, size=n).astype(np.float64)
         eta = self.score(Z)

@@ -1,200 +1,129 @@
-"""Experiment 03: Theorem 10 / Corollary 11 — weak-screening achievability (√JBK bonus).
+"""Calibrated weak-screening achievability experiment.
 
-We instantiate Assumption 8 (weak screening via a log-odds score) with a 1-D score:
-    logit(η) = logit(p0) + ε G,     G ~ N(0,1),
-    η = P(T=1 | Z)  (the Bayes posterior score).
+The historical filename is retained for compatibility.  The implemented
+posterior is exactly calibrated at every finite epsilon:
 
-We consider a score-based verification policy:
-  - inspect K records, compute η_i
-  - verify B = ⌊αK⌋ records with the largest η_i (equivalently largest G_i)
-  - "hits" := number of informative verified records = sum_{i in verified} 1{T_i=1}
-
-Since E[T_i | η_i] = η_i, we have
-    E[hits] = E[ sum_{top-B} η_i ].
-
-Theorem 10 implies that, as ε → 0 and K → ∞ with α fixed,
-    E[hits] = B p + c_G(p,α) √(J B K) + o(√(J B K)),
-where
-    J = I(T;Z),
-and (from the proof) the constant can be written as
-    c_G(p,α) = √α · m_G(α) · √(2 ln 2 · p(1-p)),
-with
-    m_G(α) := E[G | G ≥ q_α],   P(G ≥ q_α) = α.
-
-Corollary 11 / Theorem 6 yields a converse constant
-    c_upper = √(ln 2 / 2),
-so that (in terms of hits)
-    E[hits] ≤ B p + c_upper √(J B K).
-
-This experiment:
-  - Monte Carlo estimates p := E[η] and J from η (no need to sample T)
-  - Monte Carlo simulates E[hits] via sum of the top-B η's
-  - reports the normalized bonus (E[hits]-Bp)/√(J B K)
-
-Output:
-  result/table/03_theorem10_achievability_weak_screening.csv
+    eta(g) = sigmoid(a_epsilon + epsilon*g),  E[eta(G)] = p.
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
+import argparse
 import math
+from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
 
-# Make repo root importable
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from acli.utils import set_seed, RunMeta
+from acli.revision.channels import make_continuous_channel
+from acli.revision.reproducibility import canonical_configuration, make_rng, stable_task_seed
+from acli.revision.suite import git_commit
 
 
-def _logistic(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x))
-
-
-def _logit(p: float) -> float:
-    p = float(min(max(p, 1e-12), 1.0 - 1e-12))
-    return float(math.log(p / (1.0 - p)))
-
-
-def estimate_p_and_J_from_eta(p0: float, eps: float, n: int, seed: int) -> tuple[float, float]:
-    """Estimate p := E[η] and J := I(T;Z) from η samples.
-
-    For binary T, the mutual information can be written as
-        J = E[ KL(Bern(η) || Bern(p)) ]   (bits),
-    where p = P(T=1) = E[η].
-    """
-    rng = np.random.default_rng(seed)
-    G = rng.standard_normal(n).astype(np.float64)
-    eta = _logistic(_logit(p0) + eps * G)
-
-    p = float(np.mean(eta))
-
-    # J = E[ η log2(η/p) + (1-η) log2((1-η)/(1-p)) ]
-    eta_clip = np.clip(eta, 1e-12, 1.0 - 1e-12)
-    term = eta_clip * np.log2(eta_clip / p) + (1.0 - eta_clip) * np.log2((1.0 - eta_clip) / (1.0 - p))
-    J = float(np.mean(term))
-    return p, J
-
-
-def simulate_E_hits_topB(p0: float, eps: float, K: int, B: int, n_trials: int, seed: int) -> tuple[float, float]:
-    """Simulate E[hits] under top-B selection via E[sum_{top-B} η]."""
-    if B <= 0:
-        return 0.0, 0.0
-    if B > K:
-        raise ValueError("Need B <= K")
-
-    rng = np.random.default_rng(seed)
-    vals = np.empty(n_trials, dtype=np.float64)
-
-    s = _logit(p0)
-    for t in range(n_trials):
-        G = rng.standard_normal(K).astype(np.float64)
-        eta = _logistic(s + eps * G)
-        # select top-B η
-        idx = np.argpartition(eta, -B)[-B:]
-        vals[t] = float(np.sum(eta[idx]))
-
-    mean = float(vals.mean())
-    se = float(vals.std(ddof=1) / math.sqrt(n_trials))
-    return mean, se
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--smoke", action="store_true", help="use a small regression grid")
+    return parser.parse_args()
 
 
 def mG_gaussian(alpha: float) -> float:
-    """Exact m_G(α) for G~N(0,1): E[G | G ≥ q_α], with P(G ≥ q_α)=α."""
-    q = float(norm.isf(alpha))  # upper (1-α)-quantile
-    return float(norm.pdf(q) / alpha)
+    quantile = float(norm.isf(alpha))
+    return float(norm.pdf(quantile) / alpha)
 
 
-def main():
-    # ---------- defaults (no CLI args) ----------
-    seed = 2468
-    set_seed(seed)
+def simulate_top_b(channel, K: int, B: int, reps: int, seed: int) -> tuple[float, float]:
+    rng = make_rng(seed)
+    values = np.empty(reps, dtype=float)
+    for trial in range(reps):
+        eta = channel.sample_eta(K, rng=rng)
+        values[trial] = float(np.sum(eta[np.argpartition(eta, -B)[-B:]]))
+    return float(values.mean()), float(values.std(ddof=1) / math.sqrt(reps))
 
-    # Baseline prevalence parameter used in the logit intercept.
-    # NOTE: Under Assumption 8, p should equal E[η]. For symmetric G and eps>0, this is only
-    # exact at p=0.5; for other p it differs by O(eps^2). We therefore estimate p := E[η]
-    # and use it consistently in Bp, J, and constants.
-    p0 = 0.01
 
-    alpha = 0.05  # B/K
-    eps_list = [0.02, 0.05, 0.10]  # weak-screening regime: keep eps small
+def main() -> None:
+    args = parse_args()
+    master_seed = 2468
+    p = 0.01
+    alpha = 0.05
+    epsilons = (0.02, 0.05, 0.10)
+    K_values = (500, 2000) if args.smoke else (2000, 5000, 10000, 20000, 40000)
+    reps = 40 if args.smoke else 700
+    m_g = mG_gaussian(alpha)
+    converse_constant = math.sqrt(math.log(2.0) / 2.0)
+    rows: list[dict] = []
 
-    K_list = [2000, 5000, 10000, 20000, 40000]
-    n_trials = 700
-    n_for_J = 500_000
-
-    out_csv = ROOT / "result" / "table" / "03_theorem10_achievability_weak_screening.csv"
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-
-    # Theorem constants that depend only on (p,alpha,G-dist)
-    mG = mG_gaussian(alpha)
-    c_upper = math.sqrt(math.log(2.0) / 2.0)  # converse constant √(ln2/2)
-
-    rows = []
-    for eps in eps_list:
-        # Estimate p and J for this eps
-        p_hat, J = estimate_p_and_J_from_eta(p0=p0, eps=eps, n=n_for_J, seed=seed + int(1e6 * eps))
-
-        # Achievability constant (from Thm 10 proof, Gaussian G)
-        c_pred = math.sqrt(alpha) * mG * math.sqrt(2.0 * math.log(2.0) * p_hat * (1.0 - p_hat))
-
-        for K in K_list:
-            B = int(alpha * K)
-            sim, se = simulate_E_hits_topB(p0=p0, eps=eps, K=K, B=B, n_trials=n_trials, seed=seed + K + int(1e6 * eps))
-
-            baseline = B * p_hat
-            denom = math.sqrt(max(J * B * K, 1e-30))
-            bonus = sim - baseline
-            norm_bonus = bonus / denom
-            norm_se = se / denom
-
-            inner_pred = baseline + c_pred * denom
-            outer_ub = baseline + c_upper * denom
-
+    for epsilon in epsilons:
+        channel = make_continuous_channel("gaussian", p, epsilon)
+        J_bits = channel.mutual_information_bits()
+        prediction_constant = math.sqrt(alpha) * m_g * math.sqrt(
+            2.0 * math.log(2.0) * p * (1.0 - p)
+        )
+        for K in K_values:
+            B = max(1, int(alpha * K))
+            configuration = {
+                "p": p,
+                "epsilon": epsilon,
+                "alpha": alpha,
+                "K": K,
+                "B": B,
+                "reps": reps,
+            }
+            seed = stable_task_seed(master_seed, "legacy_03", "top_b", configuration)
+            simulated, se = simulate_top_b(channel, K, B, reps, seed)
+            baseline = B * p
+            scale = math.sqrt(max(J_bits * B * K, np.finfo(float).tiny))
+            weak_screening_prediction = baseline + prediction_constant * scale
+            one_branch_pinsker_bound = baseline + converse_constant * scale
             rows.append(
-                dict(
-                    eps=eps,
-                    K=K,
-                    B=B,
-                    alpha=alpha,
-                    p0=p0,
-                    p_hat=p_hat,
-                    J=J,
-                    n_for_J=n_for_J,
-                    n_trials=n_trials,
-                    sim_E_hits=sim,
-                    sim_SE_hits=se,
-                    baseline_Bp=baseline,
-                    sim_bonus_over_Bp=bonus,
-                    norm_bonus=norm_bonus,
-                    norm_SE=norm_se,
-                    theorem10_mG=mG,
-                    theorem10_c_pred=c_pred,
-                    corollary11_converse_const=c_upper,
-                    theorem10_inner_prediction=inner_pred,
-                    corollary11_outer_upper_bound=outer_ub,
-                )
+                {
+                    "eps": epsilon,
+                    "epsilon": epsilon,
+                    "intercept": channel.intercept,
+                    "calibration_error": channel.calibration_error,
+                    "K": K,
+                    "B": B,
+                    "alpha": alpha,
+                    "p0": p,
+                    "p_hat": p,
+                    "J": J_bits,
+                    "J_bits": J_bits,
+                    "realized_auc": channel.auc(),
+                    "n_for_J": 0,
+                    "n_trials": reps,
+                    "sim_E_hits": simulated,
+                    "sim_SE_hits": se,
+                    "baseline_Bp": baseline,
+                    "sim_bonus_over_Bp": simulated - baseline,
+                    "norm_bonus": (simulated - baseline) / scale,
+                    "norm_SE": se / scale,
+                    "gaussian_tail_mean": m_g,
+                    "weak_screening_prediction_coefficient": prediction_constant,
+                    "one_branch_pinsker_coefficient": converse_constant,
+                    "calibrated_weak_screening_prediction": weak_screening_prediction,
+                    "one_branch_pinsker_upper_bound": one_branch_pinsker_bound,
+                    # Historical numbered aliases retained for downstream compatibility.
+                    "theorem10_mG": m_g,
+                    "theorem10_c_pred": prediction_constant,
+                    "corollary11_converse_const": converse_constant,
+                    "theorem10_inner_prediction": weak_screening_prediction,
+                    "corollary11_outer_upper_bound": one_branch_pinsker_bound,
+                    "seed": seed,
+                    "configuration": canonical_configuration(configuration),
+                    "git_commit": git_commit(ROOT),
+                    "method": "exact_calibration_plus_Monte_Carlo_top_B",
+                }
             )
 
-            print(
-                f"eps={eps:>4.2f} | K={K:6d}, B={B:5d} | "
-                f"p≈{p_hat:.5f}, J≈{J:.3e} | "
-                f"E[hits]≈{sim:.4f} (±{2*se:.4f}) | "
-                f"(bonus/√JBK)≈{norm_bonus:.4f} (±{2*norm_se:.4f})"
-            )
-
-    meta = RunMeta.now(seed=seed, device="cpu").__dict__
-    df = pd.DataFrame(rows)
-    for k, v in meta.items():
-        df[k] = v
-
-    df.to_csv(out_csv, index=False)
-    print(f"Saved: {out_csv}")
+    # Historical output filename retained for notebook and automation compatibility.
+    output = ROOT / "result/table/03_theorem10_achievability_weak_screening.csv"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(output, index=False)
+    print(f"Saved calibrated weak-screening results: {output}")
 
 
 if __name__ == "__main__":

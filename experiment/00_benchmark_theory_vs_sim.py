@@ -24,6 +24,8 @@ from acli.benchmark import (
     benchmark_asymptotic_top_mass_sum_gaussian_mixture,
     benchmark_simulate_topB_sum_eta,
 )
+from acli.revision.reproducibility import canonical_configuration, stable_task_seed
+from acli.revision.suite import git_commit
 
 
 def main():
@@ -48,9 +50,18 @@ def main():
     rows = []
     for K in K_list:
         B = int(alpha * K)
+        configuration = {
+            "K": K,
+            "B": B,
+            "alpha": alpha,
+            "p": p,
+            "mu": mu,
+            "n_trials": n_trials,
+        }
+        task_seed = stable_task_seed(seed, "legacy_00", "top_B_simulation", configuration)
         theory = benchmark_asymptotic_top_mass_sum_gaussian_mixture(model, K=K, alpha=alpha)
         sim, se = benchmark_simulate_topB_sum_eta(
-            model, K=K, B=B, n_trials=n_trials, seed=seed + K, device=device
+            model, K=K, B=B, n_trials=n_trials, seed=task_seed, device=device
         )
         rows.append(
             dict(
@@ -64,6 +75,10 @@ def main():
                 theory_E_sumTopB_eta=theory,
                 sim_E_sumTopB_eta=sim,
                 sim_SE=se,
+                seed=task_seed,
+                configuration=canonical_configuration(configuration),
+                git_commit=git_commit(ROOT),
+                method="Gaussian_mixture_exact_tail_formula_and_Monte_Carlo",
             )
         )
         print(f"[{device}] K={K:6d}, B={B:5d} | theory={theory:.6f}, sim={sim:.6f} ± {2*se:.6f}")
@@ -71,7 +86,9 @@ def main():
     meta = RunMeta.now(seed=seed, device=device).__dict__
     df = pd.DataFrame(rows)
     for k, v in meta.items():
-        df[k] = v
+        if k not in df.columns:
+            df[k] = v
+    df["master_seed"] = seed
 
     df.to_csv(out_csv, index=False)
     print(f"Saved: {out_csv}")

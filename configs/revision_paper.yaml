@@ -1,0 +1,15 @@
+profile: paper
+master_seed: 260183
+workers: 112
+large_k_workers: 8
+quadrature_order: 40
+random_channels: 50000
+bruteforce_instances: 2000
+finite_k_mc_reps: 12000
+reconstructed_fig6_reps: 6000
+max_n: 2048
+finite_k_values: [200, 500, 1000, 3000, 10000, 30000, 100000, 300000, 1000000]
+finite_k_full_sweep: true
+frontier_full_grid: true
+weak_validity_alpha_points: 18
+weak_validity_j_points: 14

@@ -1,0 +1,37 @@
+version: 1
+title: "Epistemic Throughput: Fundamental Limits of Attention-Constrained Inference"
+notebook: notebook/06_major_revision_paper_figures.ipynb
+output_directory: result/figure/paper
+figures:
+  - paper_figure: "Fig. 1"
+    title: "JaKoB Discovery Law"
+    output: paper_fig01_jakob_discovery_law
+    source: deterministic formula evaluated in notebook
+  - paper_figure: "Fig. 2"
+    title: "ACI pipeline"
+    output: paper_fig02_aci_pipeline
+    source: Matplotlib concept diagram; no experimental data
+  - paper_figure: "Fig. 3"
+    title: "Shared-target accumulation profiles"
+    output: paper_fig03_accumulation_profiles
+    source: result/table/06_accumulation_profiles.csv
+  - paper_figure: "Fig. 4"
+    title: "Equal-J tail yield"
+    output: paper_fig04_equal_J_tail_yield
+    source: result/table/07_same_J_tail_comparison.csv
+  - paper_figure: "Fig. 5"
+    title: "Gaussian and Pareto tail leverage"
+    output: paper_fig05_tail_leverage
+    source: deterministic tail formulas evaluated in notebook
+  - paper_figure: "Fig. 6"
+    title: "Finite-length validation"
+    output: paper_fig06_finite_length_validation
+    source: result/table/05_finite_length_simulation_validation.csv
+  - paper_figure: "Fig. 7"
+    title: "Finite-K convergence"
+    output: paper_fig07_finite_K_convergence
+    source: result/table/08_finite_K_convergence.csv
+  - paper_figure: "Fig. 8"
+    title: "Weak-screening validity"
+    output: paper_fig08_weak_screening_validity
+    source: result/table/09_weak_screening_validity.csv

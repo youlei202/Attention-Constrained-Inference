@@ -36,3 +36,18 @@ result/*
 !result/table/.gitkeep
 !result/artifact/.gitkeep
 !result/figure/.gitkeep
+
+# Major-revision generated state and delivery artifacts
+environment/
+logs/
+state/
+.revision_cache/
+ACI_MAJOR_REVISION_REPRODUCIBILITY_BUNDLE.zip
+ACI_MAJOR_REVISION_REPRODUCIBILITY_BUNDLE.zip.sha256
+source_diff.patch
+changed_files.txt
+
+# Test/build caches
+.pytest_cache/
+.coverage
+htmlcov/

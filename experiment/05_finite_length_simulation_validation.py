@@ -1,455 +1,251 @@
-"""Experiment 05: Finite-length simulation validation (Figure 4).
-
-We validate that finite-length Monte Carlo points lie close to the JBK scaling-law
-prediction for *information gain under log-loss* when using the Top-B policy.
-
-Model (decoupled claims; Assumption 9)
--------------------------------------
-We use the decoupled-claim specialization where each inspected record i has:
-- a latent type T_i ∈ {0,1} indicating whether verification is informative,
-- an inspection statistic/feature G_i (a cheap screening signal),
-- an independent latent claim Θ_i (only revealed via verification when T_i=1).
-
-Screening model ("Logistic Regression")
---------------------------------------
-We generate (T,G) via a 1-D logistic regression model:
-
-    G ~ N(0,1),
-    η(G) := P(T=1 | G) = sigmoid(logit(p0) + ε·G).
-
-Top-B policy
-------------
-Inspect K records (observe G_1..G_K), compute η_i=η(G_i), then verify the B
-records with the largest η_i (equivalently largest G_i).
-
-Verification channel and log-loss gain
---------------------------------------
-For each verified record:
-- if T_i=0: verification is uninformative about Θ_i,
-- if T_i=1: verification sends V_i through a BSC(δ) from Θ_i (Θ_i ~ Bern(1/2)).
-
-Under log-loss, the *information gain* (in bits) equals
-
-    IG := H(Θ) - D(K,B),
-
-and in the decoupled model it concentrates around
-
-    E[IG] = I_ver · E[hits],
-
-where hits is the number of informative verified records (sum of T_i over
-verified indices) and I_ver = 1 - h2(δ) for the BSC(δ) channel.
-
-Theory curve (JBK scaling)
---------------------------
-Theorem 10 (Eq. 6/7/8 in the paper) predicts in the weak-screening regime:
-
-    E[IG]/I_ver ≈ min{B, Bp + c_G(p,α) · sqrt(J B K)}
-
-with α=B/K, J=I(T;G) (bits), and for Gaussian G:
-
-    c_G(p,α) = sqrt(2 ln 2 · p(1-p) · α) · m_G(α),
-    m_G(α) = E[G | G ≥ q_α],   P(G ≥ q_α)=α.
-
-We plot the above prediction against finite-length Monte Carlo points.
-
-Output
-------
-Writes:
-  result/table/05_finite_length_simulation_validation.csv
-
-The companion notebook renders:
-  result/figure/05_finite_length_simulation_validation.pdf
-"""
+#!/usr/bin/env python3
+"""Calibrated finite-length validation data for paper Figure 6."""
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
+import argparse
 import math
+import os
+from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
-from scipy.integrate import quad
+from scipy.stats import binom, norm
 
-try:
-    import torch  # type: ignore
-
-    _TORCH_OK = True
-except Exception:
-    torch = None  # type: ignore
-    _TORCH_OK = False
-
-# Make repo root importable
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from acli.utils import RunMeta, get_device, h2, set_seed
+from acli.revision.channels import make_continuous_channel_for_auc
+from acli.revision.finite_k import finite_k_top_b_precision, large_k_top_tail_precision
+from acli.revision.frontier import q_one_branch, q_one_branch_raw, q_pinsker_clipped, q_star
+from acli.revision.information import h2
+from acli.revision.reproducibility import canonical_configuration, make_rng, stable_task_seed
+from acli.revision.suite import git_commit, load_profile
 
 
-def _logit(p: float) -> float:
-    p = float(min(max(p, 1e-12), 1.0 - 1e-12))
-    return float(math.log(p / (1.0 - p)))
+TARGET_AUCS = (0.55, 0.70, 0.79, 0.90)
+B_GRID = (10, 20, 30, 50, 80, 120, 200, 300, 500, 800, 1200, 1600, 2000)
 
 
-def _sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x))
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", default="smoke", help="smoke, paper, or profile YAML")
+    parser.add_argument("--workers", type=int, default=1)
+    return parser.parse_args()
 
 
-def mG_gaussian(alpha: float) -> float:
-    """Exact upper-tail mean m_G(α) for G~N(0,1)."""
-    alpha = float(alpha)
-    if not (0.0 < alpha < 1.0):
-        raise ValueError("Need alpha in (0,1)")
-    q = float(norm.isf(alpha))  # upper (1-α)-quantile
-    return float(norm.pdf(q) / alpha)
+def atomic_csv(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    frame.to_csv(temporary, index=False)
+    os.replace(temporary, path)
 
 
-
-def expected_min_binomial_normal_approx(K: int, p: float, B: int) -> float:
-    """Approximate E[min(B, N)] for N~Binomial(K,p) using a normal approximation."""
-    p = float(min(max(p, 0.0), 1.0))
-    B = int(B)
-    if B <= 0:
-        return 0.0
-    mu = K * p
-    # If B is far above the mean, min(B,N)=N w.h.p., so expectation is mu.
-    if B >= K:
-        return float(min(B, mu))
-    var = K * p * (1.0 - p)
-    if var <= 1e-12:
-        return float(min(B, mu))
-    sigma = var ** 0.5
-    z = (B - mu) / sigma
-    # E[(X-B)_+] for X~N(mu,sigma^2) is sigma*phi(z) + (mu-B)*(1-Phi(z))
-    tail = float(1.0 - norm.cdf(z))
-    exc = float(sigma * norm.pdf(z) + (mu - B) * tail)
-    return float(mu - exc)
+def gaussian_tail_mean(alpha: float) -> float:
+    threshold = float(norm.isf(alpha))
+    return float(norm.pdf(threshold) / alpha)
 
 
-def benchmark_hits_singleletter_logistic_gaussian(p0: float, eps: float, K: int, B: int) -> float:
-    """Appendix A (Cor. 18) single-letter benchmark for E[hits] under Top-B.
-
-    With G~N(0,1), score η(G)=sigmoid(logit(p0)+eps*G), and α=B/K,
-        E[hits] ≈ K * E[ η(G) · 1{G ≥ q_α} ],  where P(G≥q_α)=α.
-
-    This avoids the weak-screening linearization and remains accurate for larger eps.
-    """
-    if B <= 0:
-        return 0.0
-    if B > K:
-        raise ValueError('Need B <= K')
-    alpha = B / K
-    q = float(norm.isf(alpha))
-    s = _logit(p0)
-
-    if abs(eps) < 1e-12:
-        # η is constant = p0; tail mass is alpha.
-        return float(K * (p0 * alpha))
-
-    def integrand(g: float) -> float:
-        # sigmoid(s + eps*g) * phi(g)
-        # Use expit-like stable computation.
-        x = s + eps * g
-        if x >= 0:
-            z = math.exp(-x)
-            eta = 1.0 / (1.0 + z)
-        else:
-            z = math.exp(x)
-            eta = z / (1.0 + z)
-        return float(eta * norm.pdf(g))
-
-    val, _ = quad(integrand, q, float('inf'), limit=200)
-    return float(K * val)
-
-def estimate_p_and_J(p0: float, eps: float, n: int, seed: int) -> tuple[float, float]:
-    """Estimate p := P(T=1) and J := I(T;G) (bits) via Monte Carlo.
-
-    For binary T with posterior η(G)=P(T=1|G),
-        J = E[ KL(Bern(η) || Bern(p)) ],   where p = E[η].
-    """
-    rng = np.random.default_rng(seed)
-    g = rng.standard_normal(n).astype(np.float64)
-    eta = _sigmoid(_logit(p0) + eps * g)
-
-    p = float(np.mean(eta))
-
-    eta_clip = np.clip(eta, 1e-12, 1.0 - 1e-12)
-    p_clip = float(min(max(p, 1e-12), 1.0 - 1e-12))
-    kl = eta_clip * np.log2(eta_clip / p_clip) + (1.0 - eta_clip) * np.log2((1.0 - eta_clip) / (1.0 - p_clip))
-    J = float(np.mean(kl))
-    return p, J
+def finite_pool_oracle_hits(K: int, p: float, B: int) -> float:
+    """Exact E[min(B,N)] for N~Binomial(K,p), evaluated by survival sums."""
+    return float(np.sum(binom.sf(np.arange(B), K, p)))
 
 
-def estimate_auc(p0: float, eps: float, n: int, seed: int) -> float:
-    """Estimate AUC for predicting T from the score η(G).
-
-    Uses the rank-statistic (Mann–Whitney) formula. Ties are negligible
-    since η is continuous almost surely.
-    """
-    rng = np.random.default_rng(seed)
-    g = rng.standard_normal(n).astype(np.float64)
-    eta = _sigmoid(_logit(p0) + eps * g)
-    t = (rng.random(n) < eta).astype(np.int8)
-
-    n_pos = int(t.sum())
-    n_neg = int(n - n_pos)
-    if n_pos == 0 or n_neg == 0:
-        return float("nan")
-
-    order = np.argsort(eta)
-    ranks = np.empty(n, dtype=np.float64)
-    ranks[order] = np.arange(1, n + 1)
-
-    rank_sum_pos = float(ranks[t == 1].sum())
-    auc = (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
-    return float(auc)
-
-
-def simulate_gain_topB(
-    p0: float,
-    eps: float,
-    delta: float,
+def simulate_gain_grid(
+    channel,
     K: int,
-    B: int,
-    n_trials: int,
+    budgets: tuple[int, ...],
+    repetitions: int,
+    delta: float,
     seed: int,
-    device: str = "cpu",
-) -> tuple[float, float, float, float]:
-    """Monte Carlo simulation for information gain under Top-B.
-
-    Returns:
-        mean_gain_bits, se_gain_bits, mean_hits, se_hits
-
-    Implementation notes:
-    - We simulate the *realized* log-loss reduction (bits) using the BSC(δ)
-      verification channel. The gain per informative verification depends only
-      on whether the channel flipped (no need to explicitly sample Θ).
-    - If torch+CUDA is available and device=="cuda", we use a batched GPU path.
-    """
-    if B <= 0:
-        return 0.0, 0.0, 0.0, 0.0
-    if B > K:
-        raise ValueError("Need B <= K")
-
-    delta = float(delta)
-    if not (0.0 < delta < 0.5):
-        raise ValueError("Need delta in (0, 0.5) for a meaningful BSC")
-
+) -> dict[int, tuple[float, float, float, float]]:
+    """Jointly simulate all budgets while selecting with argpartition."""
+    rng = make_rng(seed)
+    max_budget = max(budgets)
+    gains = {budget: np.empty(repetitions, dtype=np.float64) for budget in budgets}
+    hits = {budget: np.empty(repetitions, dtype=np.float64) for budget in budgets}
     gain_correct = 1.0 + math.log2(1.0 - delta)
     gain_flip = 1.0 + math.log2(delta)
+    chunk_size = min(64, repetitions)
+    offset = 0
+    while offset < repetitions:
+        count = min(chunk_size, repetitions - offset)
+        eta = channel.sample_eta(count * K, rng=rng).reshape(count, K)
+        candidate_indices = np.argpartition(eta, K - max_budget, axis=1)[:, -max_budget:]
+        candidates = np.take_along_axis(eta, candidate_indices, axis=1)
+        descending = np.take_along_axis(
+            candidates,
+            np.argsort(candidates, axis=1)[:, ::-1],
+            axis=1,
+        )
+        informative = rng.binomial(1, descending).astype(np.float64)
+        flipped = rng.random(descending.shape) < delta
+        realized = informative * np.where(flipped, gain_flip, gain_correct)
+        cumulative_gain = np.cumsum(realized, axis=1)
+        cumulative_hits = np.cumsum(informative, axis=1)
+        for budget in budgets:
+            gains[budget][offset : offset + count] = cumulative_gain[:, budget - 1]
+            hits[budget][offset : offset + count] = cumulative_hits[:, budget - 1]
+        offset += count
 
-    # ---------- GPU batched path ----------
-    if device == "cuda" and _TORCH_OK and torch is not None and torch.cuda.is_available():
-        gen = torch.Generator(device="cuda")
-        gen.manual_seed(int(seed))
-
-        g = torch.randn((n_trials, K), device="cuda", generator=gen)
-        logits = _logit(p0) + float(eps) * g
-        eta = torch.sigmoid(logits)
-
-        T = torch.bernoulli(eta, generator=gen)  # (n_trials, K)
-        top_idx = torch.topk(eta, k=B, dim=1, largest=True, sorted=False).indices
-        Tver = T.gather(1, top_idx)  # (n_trials, B)
-        hits = Tver.sum(dim=1)
-
-        # Channel flips for the verified indices (we only count flips when T=1)
-        flip = torch.bernoulli(torch.full((n_trials, B), delta, device="cuda"), generator=gen)
-
-        gc = torch.tensor(gain_correct, device="cuda")
-        gf = torch.tensor(gain_flip, device="cuda")
-        per = torch.where(flip < 0.5, gc, gf)  # (n_trials, B)
-
-        gains = (per * Tver).sum(dim=1)  # (n_trials,)
-
-        mean_gain = float(gains.mean().item())
-        se_gain = float(gains.std(unbiased=True).item() / math.sqrt(n_trials))
-
-        mean_hits = float(hits.mean().item())
-        se_hits = float(hits.std(unbiased=True).item() / math.sqrt(n_trials))
-
-        return mean_gain, se_gain, mean_hits, se_hits
-
-    # ---------- CPU fallback ----------
-    rng = np.random.default_rng(seed)
-    s = _logit(p0)
-
-    gains = np.empty(n_trials, dtype=np.float64)
-    hits_arr = np.empty(n_trials, dtype=np.float64)
-
-    for t in range(n_trials):
-        g = rng.standard_normal(K).astype(np.float64)
-        eta = _sigmoid(s + eps * g)
-
-        T = (rng.random(K) < eta).astype(np.int8)
-        idx = np.argpartition(eta, -B)[-B:]
-        Tver = T[idx]  # 0/1
-
-        # flips over the verified indices
-        flips = (rng.random(B) < delta).astype(np.int8)
-        per = np.where(flips == 0, gain_correct, gain_flip)
-
-        gains[t] = float(np.sum(per * Tver))
-        hits_arr[t] = float(np.sum(Tver))
-
-    mean_gain = float(gains.mean())
-    se_gain = float(gains.std(ddof=1) / math.sqrt(n_trials))
-
-    mean_hits = float(hits_arr.mean())
-    se_hits = float(hits_arr.std(ddof=1) / math.sqrt(n_trials))
-
-    return mean_gain, se_gain, mean_hits, se_hits
+    output: dict[int, tuple[float, float, float, float]] = {}
+    for budget in budgets:
+        output[budget] = (
+            float(gains[budget].mean()),
+            float(gains[budget].std(ddof=1) / math.sqrt(repetitions)),
+            float(hits[budget].mean()),
+            float(hits[budget].std(ddof=1) / math.sqrt(repetitions)),
+        )
+    return output
 
 
-def main():
-    # ---------- defaults ----------
-    seed = 505
-    set_seed(seed)
-
-    device = get_device(prefer_cuda=True)
-
-    # Inspection budget (attention) and verification budgets (vary B)
-    # NOTE: K=1e4 is CPU-friendly; set K=1e5 for a heavier run.
+def main() -> None:
+    args = parse_args()
+    profile, profile_path = load_profile(args.profile)
+    master_seed = int(profile["master_seed"])
+    repetitions = int(profile["reconstructed_fig6_reps"])
+    p = 0.01
     K = 10_000
-    B_list = [10, 20, 30, 50, 80, 120, 200, 300, 500, 800, 1200, 1600, 2000]
-    B_list = [B for B in B_list if B <= K]
-
-    # Logistic-regression screening parameters
-    p0 = 0.01  # base prevalence parameter inside the logit intercept
-
-    # Robustness sweep: weak vs stronger screening (target AUC roughly ~0.55 / 0.7 / 0.8 / 0.9)
-    scenarios = [
-        dict(name="weak", eps=0.20),
-        dict(name="auc~0.7", eps=0.75),
-        dict(name="auc~0.8", eps=1.20),
-        # Stronger screening for a 4-panel figure (AUC typically ≳0.88–0.92 depending on p0)
-        dict(name="auc~0.9", eps=2.00),
-    ]
-
-    # Verification channel (BSC)
     delta = 0.10
-    I_ver = 1.0 - h2(delta)
-
-    # Monte Carlo budgets
-    n_trials = 400
-    n_for_J = 500_000
-    n_for_auc = 200_000
-
-    out_csv = ROOT / "result" / "table" / "05_finite_length_simulation_validation.csv"
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-
+    i_ver = 1.0 - float(h2(delta))
     rows: list[dict] = []
 
-    for sc in scenarios:
-        eps = float(sc["eps"])
-        name = str(sc["name"])
+    for target_auc in TARGET_AUCS:
+        channel = make_continuous_channel_for_auc("gaussian", p, target_auc)
+        J_bits = channel.mutual_information_bits()
+        realized_auc = channel.auc()
+        joint_configuration = {
+            "family": "gaussian",
+            "p": p,
+            "target_auc": target_auc,
+            "epsilon": channel.epsilon,
+            "intercept": channel.intercept,
+            "K": K,
+            "B_grid": B_GRID,
+            "delta": delta,
+            "repetitions": repetitions,
+            "profile": profile["profile"],
+        }
+        task_seed = stable_task_seed(master_seed, "05_finite_length", "scenario_MC", joint_configuration)
+        monte_carlo = simulate_gain_grid(channel, K, B_GRID, repetitions, delta, task_seed)
+        print(
+            f"[05] AUC={target_auc:.2f} epsilon={channel.epsilon:.6g} "
+            f"J={J_bits:.6g} reps={repetitions}",
+            flush=True,
+        )
 
-        # Estimate p and J once per scenario
-        p_hat, J = estimate_p_and_J(p0=p0, eps=eps, n=n_for_J, seed=seed + int(1e6 * eps))
-        auc_hat = estimate_auc(p0=p0, eps=eps, n=n_for_auc, seed=seed + int(2e6 * eps))
-
-        print(f"\n[{name}] eps={eps:.3f} | estimated p≈{p_hat:.5f}, J≈{J:.3e} bits, AUC≈{auc_hat:.3f}")
-
-        for B in B_list:
+        for B in B_GRID:
             alpha = B / K
-            mG = mG_gaussian(alpha)
-
-            # Eq. (7) constant (Gaussian scores)
-            cG = math.sqrt(2.0 * math.log(2.0) * p_hat * (1.0 - p_hat) * alpha) * mG
-
-            denom = math.sqrt(max(J * B * K, 1e-30))
-
-            # Finite-pool oracle: even with perfect knowledge of T, we cannot exceed
-            # the number of informative items available among the K inspected records.
-            oracle_pool_hits = expected_min_binomial_normal_approx(K=K, p=p_hat, B=B)
-
-            # Weak-screening theory (Eq. 6/8), clipped by the finite pool.
-            theory_hits = min(B, oracle_pool_hits, B * p_hat + cG * denom)
-            theory_gain_bits = I_ver * theory_hits
-
-            # Appendix A single-letter benchmark (Cor. 18): works beyond weak-screening.
-            benchmark_hits = benchmark_hits_singleletter_logistic_gaussian(p0=p0, eps=eps, K=K, B=B)
-            benchmark_hits = min(B, oracle_pool_hits, benchmark_hits)
-            benchmark_gain_bits = I_ver * benchmark_hits
-
-            # Theorem 6 converse (optional reference), also clipped by the finite pool.
-            upper_hits = min(B, oracle_pool_hits, B * p_hat + math.sqrt((math.log(2.0) / 2.0) * J * B * K))
-            upper_gain_bits = I_ver * upper_hits
-
-            # Monte Carlo simulation of realized log-loss reduction
-            sim_gain_bits, sim_gain_se, sim_hits, sim_hits_se = simulate_gain_topB(
-                p0=p0,
-                eps=eps,
-                delta=delta,
-                K=K,
-                B=B,
-                n_trials=n_trials,
-                seed=seed + 10_000 * int(1000 * eps) + B,
-                device=device,
+            q_finite = finite_k_top_b_precision(channel, K, B)
+            q_tail = large_k_top_tail_precision(channel, alpha)
+            m_g = gaussian_tail_mean(alpha)
+            weak_epsilon_q = float(
+                np.clip(p + channel.epsilon * p * (1.0 - p) * m_g, p, min(1.0, p / alpha))
             )
-
-            rows.append(
-                dict(
-                    scenario=name,
-                    eps=eps,
-                    p0=p0,
-                    p_hat=p_hat,
-                    J=J,
-                    auc_hat=auc_hat,
-                    K=K,
-                    B=B,
-                    alpha=alpha,
-                    oversampling_ratio=K / B,
-                    delta=delta,
-                    I_ver_bits=I_ver,
-                    mG=mG,
-                    cG=cG,
-                    n_trials=n_trials,
-                    n_for_J=n_for_J,
-                    n_for_auc=n_for_auc,
-                    sim_gain_bits=sim_gain_bits,
-                    sim_gain_bits_se=sim_gain_se,
-                    sim_gain_over_Iver=sim_gain_bits / I_ver,
-                    sim_gain_over_Iver_se=sim_gain_se / I_ver,
-                    sim_hits=sim_hits,
-                    sim_hits_se=sim_hits_se,
-                    theory_gain_bits=theory_gain_bits,
-                    theory_gain_over_Iver=theory_hits,
-                    theorem6_upper_gain_bits=upper_gain_bits,
-                    theorem6_upper_gain_over_Iver=upper_hits,
-                    # Combined upper envelope: cannot exceed finite-pool oracle
-                    upper_thm6_pool_gain_bits=min(upper_gain_bits, I_ver * oracle_pool_hits, I_ver * B),
-                    upper_thm6_pool_gain_over_Iver=min(upper_hits, oracle_pool_hits, B),
-                    baseline_random_gain_bits=I_ver * (B * p_hat),
-
-                    # Two oracles: (i) unlimited-supply (B·I_ver) and (ii) finite-pool (≈I_ver·E[min(B,N_inf)])
-                    oracle_unlimited_gain_bits=I_ver * B,
-                    oracle_gain_bits=I_ver * B,  # backward-compatible alias
-                    oracle_pool_hits=oracle_pool_hits,
-                    oracle_pool_gain_bits=I_ver * oracle_pool_hits,
-                    oracle_pool_gain_over_Iver=oracle_pool_hits,
-
-                    # Theory curves
-                    benchmark_gain_bits=benchmark_gain_bits,
-                    benchmark_gain_over_Iver=benchmark_hits,
-
+            weak_j_q = float(
+                np.clip(
+                    p + m_g * math.sqrt(2.0 * math.log(2.0) * p * (1.0 - p) * J_bits),
+                    p,
+                    min(1.0, p / alpha),
                 )
             )
-
-            print(
-                f"  B={B:4d} (K/B={K/B:6.1f}) | "
-                f"sim IG={sim_gain_bits:8.3f} ± {2*sim_gain_se:7.3f} bits | "
-                f"theory={theory_gain_bits:8.3f} bits | "
-                f"UB={upper_gain_bits:8.3f} bits"
+            sharp_q = q_star(p, alpha, J_bits)
+            pinsker_two_q = q_pinsker_clipped(p, alpha, J_bits)
+            pinsker_original_raw_q = q_one_branch_raw(p, alpha, J_bits)
+            pinsker_original_clipped_q = q_one_branch(p, alpha, J_bits)
+            oracle_hits = finite_pool_oracle_hits(K, p, B)
+            pinsker_original_pool_clipped_hits = min(
+                B, oracle_hits, B * pinsker_original_raw_q
+            )
+            mc_gain, mc_gain_se, mc_hits, mc_hits_se = monte_carlo[B]
+            row_configuration = {**joint_configuration, "B": B, "alpha": alpha}
+            rows.append(
+                {
+                    "scenario": f"auc_{target_auc:.2f}",
+                    "family": "gaussian",
+                    "target_auc": target_auc,
+                    "realized_auc": realized_auc,
+                    "auc_hat": realized_auc,
+                    "epsilon": channel.epsilon,
+                    "eps": channel.epsilon,
+                    "intercept": channel.intercept,
+                    "calibration_error": channel.calibration_error,
+                    "p": p,
+                    "p0": p,
+                    "p_hat": p,
+                    "J_bits": J_bits,
+                    "J": J_bits,
+                    "K": K,
+                    "B": B,
+                    "alpha": alpha,
+                    "oversampling_ratio": K / B,
+                    "delta": delta,
+                    "I_ver_bits": i_ver,
+                    "mG": m_g,
+                    "n_trials": repetitions,
+                    "n_for_J": 0,
+                    "n_for_auc": 0,
+                    "mc_gain_bits": mc_gain,
+                    "mc_gain_se_bits": mc_gain_se,
+                    "mc_hits": mc_hits,
+                    "mc_hits_se": mc_hits_se,
+                    "exact_finite_K_precision": q_finite,
+                    "exact_finite_K_gain_bits": i_ver * B * q_finite,
+                    "large_K_top_tail_precision": q_tail,
+                    "large_K_top_tail_gain_bits": i_ver * B * q_tail,
+                    "weak_epsilon_precision": weak_epsilon_q,
+                    "weak_epsilon_gain_bits": i_ver * B * weak_epsilon_q,
+                    "weak_J_precision": weak_j_q,
+                    "weak_J_gain_bits": i_ver * B * weak_j_q,
+                    "sharp_binary_KL_precision": sharp_q,
+                    "sharp_binary_KL_gain_bits": i_ver * B * sharp_q,
+                    "two_branch_pinsker_precision": pinsker_two_q,
+                    "two_branch_pinsker_gain_bits": i_ver * B * pinsker_two_q,
+                    "original_pinsker_jakob_raw_precision": pinsker_original_raw_q,
+                    "original_pinsker_jakob_raw_gain_bits": i_ver * B * pinsker_original_raw_q,
+                    "original_pinsker_jakob_clipped_precision": pinsker_original_clipped_q,
+                    "original_pinsker_jakob_clipped_gain_bits": i_ver
+                    * B
+                    * pinsker_original_clipped_q,
+                    "original_pinsker_jakob_pool_clipped_gain_bits": i_ver
+                    * pinsker_original_pool_clipped_hits,
+                    # Unqualified compatibility alias: the analytic raw bound,
+                    # never the separately labeled finite-pool composite.
+                    "original_pinsker_jakob_gain_bits": i_ver * B * pinsker_original_raw_q,
+                    "finite_pool_oracle_hits": oracle_hits,
+                    "finite_pool_oracle_gain_bits": i_ver * oracle_hits,
+                    "baseline_random_gain_bits": i_ver * B * p,
+                    "seed": task_seed,
+                    "configuration": canonical_configuration(row_configuration),
+                    "git_commit": git_commit(ROOT),
+                    "method": "Monte_Carlo_gain_and_deterministic_order_statistic_quadrature",
+                    # Backward-compatible columns consumed by notebook/05.
+                    "sim_gain_bits": mc_gain,
+                    "sim_gain_bits_se": mc_gain_se,
+                    "sim_gain_over_Iver": mc_gain / i_ver,
+                    "sim_gain_over_Iver_se": mc_gain_se / i_ver,
+                    "sim_hits": mc_hits,
+                    "sim_hits_se": mc_hits_se,
+                    "theory_gain_bits": i_ver * B * weak_j_q,
+                    "theory_gain_over_Iver": B * weak_j_q,
+                    "theorem6_upper_gain_bits": i_ver * B * pinsker_original_raw_q,
+                    "theorem6_upper_gain_over_Iver": B * pinsker_original_raw_q,
+                    "upper_thm6_pool_gain_bits": i_ver * pinsker_original_pool_clipped_hits,
+                    "upper_thm6_pool_gain_over_Iver": pinsker_original_pool_clipped_hits,
+                    "oracle_unlimited_gain_bits": i_ver * B,
+                    "oracle_gain_bits": i_ver * B,
+                    "oracle_pool_hits": oracle_hits,
+                    "oracle_pool_gain_bits": i_ver * oracle_hits,
+                    "oracle_pool_gain_over_Iver": oracle_hits,
+                    "benchmark_gain_bits": i_ver * B * q_finite,
+                    "benchmark_gain_over_Iver": B * q_finite,
+                }
             )
 
-    meta = RunMeta.now(seed=seed, device=device).__dict__
-    df = pd.DataFrame(rows)
-    for k, v in meta.items():
-        df[k] = v
-
-    df.to_csv(out_csv, index=False)
-    print(f"\nSaved: {out_csv}")
+    output = ROOT / "result/table/05_finite_length_simulation_validation.csv"
+    atomic_csv(pd.DataFrame(rows), output)
+    print(f"[05] saved {output} from {profile_path}", flush=True)
 
 
 if __name__ == "__main__":
